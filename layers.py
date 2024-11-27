@@ -138,6 +138,10 @@ class Conv3x3(nn.Module):
 
 class BackprojectDepth(nn.Module):
     """Layer to transform a depth image into a point cloud
+    将深度图像转换为点云的层
+    batch_size：     批量大小
+    height：         当前尺度的高度
+    width：          当前尺度的宽度
     """
     def __init__(self, batch_size, height, width):
         super(BackprojectDepth, self).__init__()
@@ -145,17 +149,24 @@ class BackprojectDepth(nn.Module):
         self.batch_size = batch_size
         self.height = height
         self.width = width
-
+        
+        # np.meshgrid()：从坐标向量中返回坐标矩阵; indexing：输出的笛卡尔（默认为“ xy”）或矩阵（“ ij”）索引。
+        # 返回list,有两个元素,第一个元素是X轴的取值,第二个元素是Y轴的取值
         meshgrid = np.meshgrid(range(self.width), range(self.height), indexing='xy')
         self.id_coords = np.stack(meshgrid, axis=0).astype(np.float32)
+        # 作为nn.Module中的可训练参数使用，但参数不更新
         self.id_coords = nn.Parameter(torch.from_numpy(self.id_coords),
                                       requires_grad=False)
 
+        # 对应尺寸的全 1 参数
         self.ones = nn.Parameter(torch.ones(self.batch_size, 1, self.height * self.width),
                                  requires_grad=False)
 
+        # 将x, y 所有取值在 0 维拼接，然后再在拼接后的 0维增加一个长度为1的维度
         self.pix_coords = torch.unsqueeze(torch.stack(
             [self.id_coords[0].view(-1), self.id_coords[1].view(-1)], 0), 0)
+        
+        # .repeat(): 对张量进行重复扩充。 详见：https://blog.csdn.net/qq_34806812/article/details/89388210
         self.pix_coords = self.pix_coords.repeat(batch_size, 1, 1)
         self.pix_coords = nn.Parameter(torch.cat([self.pix_coords, self.ones], 1),
                                        requires_grad=False)
@@ -170,6 +181,7 @@ class BackprojectDepth(nn.Module):
 
 class Project3D(nn.Module):
     """Layer which projects 3D points into a camera with intrinsics K and at position T
+       将 3D 点投影到具有内联函数 K 和位置 T 的相机中的层
     """
     def __init__(self, batch_size, height, width, eps=1e-7):
         super(Project3D, self).__init__()

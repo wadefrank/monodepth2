@@ -18,7 +18,7 @@ from torchvision import transforms
 
 
 def pil_loader(path):
-    # open path as file to avoid ResourceWarning
+    # open path as file to avoid ResourceWarning 将路径作为文件打开以避免ResourceWarning
     # (https://github.com/python-pillow/Pillow/issues/835)
     with open(path, 'rb') as f:
         with Image.open(f) as img:
@@ -27,16 +27,16 @@ def pil_loader(path):
 
 class MonoDataset(data.Dataset):
     """Superclass for monocular dataloaders
-
+       单目数据加载器的父类
     Args:
-        data_path
-        filenames
-        height
-        width
-        frame_idxs
-        num_scales
-        is_train
-        img_ext
+        data_path   数据集的根目录
+        filenames   txt 文件中的每一行
+        height      图像高度
+        width       图像宽度
+        frame_idxs  帧数
+        num_scales  多尺度的数量
+        is_train    是否是训练集
+        img_ext     图片后缀
     """
     def __init__(self,
                  data_path,
@@ -54,7 +54,7 @@ class MonoDataset(data.Dataset):
         self.height = height
         self.width = width
         self.num_scales = num_scales
-        self.interp = Image.ANTIALIAS
+        self.interp = Image.ANTIALIAS   # 用于在图像处理时指定抗锯齿（anti-aliasing）插值方法
 
         self.frame_idxs = frame_idxs
 
@@ -89,10 +89,12 @@ class MonoDataset(data.Dataset):
 
     def preprocess(self, inputs, color_aug):
         """Resize colour images to the required scales and augment if required
-
+           将彩色图像调整到所需的比例，并且如果需要的话可以对图像进行增强
         We create the color_aug object in advance and apply the same augmentation to all
         images in this item. This ensures that all images input to the pose network receive the
         same augmentation.
+        我们预先创建了 color_aug 对象，并将相同的增强应用于该项目中的所有图像。
+        这确保了输入到姿态网络的所有图像都接收到相同的增强。
         """
         for k in list(inputs):
             frame = inputs[k]
@@ -113,15 +115,18 @@ class MonoDataset(data.Dataset):
 
     def __getitem__(self, index):
         """Returns a single training item from the dataset as a dictionary.
-
+           将数据集中的单个训练项作为字典返回。
+           
         Values correspond to torch tensors.
+        值对应于tensor张量。
         Keys in the dictionary are either strings or tuples:
+        字典中的键是字符串或元组：
 
-            ("color", <frame_id>, <scale>)          for raw colour images,
-            ("color_aug", <frame_id>, <scale>)      for augmented colour images,
-            ("K", scale) or ("inv_K", scale)        for camera intrinsics,
-            "stereo_T"                              for camera extrinsics, and
-            "depth_gt"                              for ground truth depth maps.
+            ("color", <frame_id>, <scale>)          for raw colour images, 用于原始彩色图像
+            ("color_aug", <frame_id>, <scale>)      for augmented colour images, 用于增强的彩色图像
+            ("K", scale) or ("inv_K", scale)        for camera intrinsics, 用于相机内置参数
+            "stereo_T"                              for camera extrinsics, and, 用于相机外部参数
+            "depth_gt"                              for ground truth depth maps. 深度真值
 
         <frame_id> is either:
             an integer (e.g. 0, -1, or 1) representing the temporal step relative to 'index',
@@ -137,22 +142,32 @@ class MonoDataset(data.Dataset):
         """
         inputs = {}
 
+        # 随机做训练数据颜色增强预处理
         do_color_aug = self.is_train and random.random() > 0.5
+        # 随机做训练数据水平左右flip预处理
         do_flip = self.is_train and random.random() > 0.5
 
+        # index是train_txt中的第index行
         line = self.filenames[index].split()
+        # train_files.txt中一行数据的第一部分，即图片所在目录
         folder = line[0]
 
+        # 每一行一般都为3个部分，第二个部分是图片的frame_index
         if len(line) == 3:
             frame_index = int(line[1])
         else:
             frame_index = 0
 
+        # side为l或r，表明该图片是左或右摄像头所拍
         if len(line) == 3:
             side = line[2]
         else:
             side = None
 
+
+        # 在stereo训练时， frame_idxs为["0","s"]
+        # 通过这个for循环，inputs[("color", "0", -1)]和inputs[("color", "s", -1)]
+        # 分别获得了frame_index和它对应的另外一个摄像头拍的图片数据。
         for i in self.frame_idxs:
             if i == "s":
                 other_side = {"r": "l", "l": "r"}[side]
@@ -161,6 +176,8 @@ class MonoDataset(data.Dataset):
                 inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
 
         # adjusting intrinsics to match each scale in the pyramid
+        # 调整内置参数以匹配金字塔（多尺度）中的每个比例
+        # 因为模型有4个尺度，所以对应4个相机内参
         for scale in range(self.num_scales):
             K = self.K.copy()
 
@@ -172,23 +189,29 @@ class MonoDataset(data.Dataset):
             inputs[("K", scale)] = torch.from_numpy(K)
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
 
+        # 颜色增强参数设定
         if do_color_aug:
             color_aug = transforms.ColorJitter(
                 self.brightness, self.contrast, self.saturation, self.hue)
         else:
             color_aug = (lambda x: x)
 
+        # 训练前数据预处理以及对输入数据做多尺度resize
         self.preprocess(inputs, color_aug)
 
+        # 经过preprocess，产生了inputs[("color"，"0", 0/1/2/3)]和inputs[("color_aug"，"0", 0/1/2/3)]。
+        # 所以可以将原始的inputs[("color", i, -1)]和[("color_aug", i, -1)]释放
         for i in self.frame_idxs:
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
 
+        # load_depth为False，因为不需要GT label数据
         if self.load_depth:
             depth_gt = self.get_depth(folder, frame_index, side, do_flip)
             inputs["depth_gt"] = np.expand_dims(depth_gt, 0)
             inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
 
+        # 在stereo训练时，还需要构造双目姿态的平移矩阵参数inputs["stereo_T"]
         if "s" in self.frame_idxs:
             stereo_T = np.eye(4, dtype=np.float32)
             baseline_sign = -1 if do_flip else 1

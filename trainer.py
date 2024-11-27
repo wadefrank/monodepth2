@@ -28,10 +28,12 @@ from IPython import embed
 
 class Trainer:
     def __init__(self, options):
+        # 训练设置
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
         # checking height and width are multiples of 32
+        # 检查高度和宽度是否为 32 的倍数
         assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
         assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
 
@@ -40,69 +42,113 @@ class Trainer:
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
+        # 设置的损失scale个数
         self.num_scales = len(self.opt.scales)
+        # 输入帧个数
         self.num_input_frames = len(self.opt.frame_ids)
+        # 如果位姿模型得到的输入为 pairs，位姿帧个数为 2；否则为等于输入帧个数
         self.num_pose_frames = 2 if self.opt.pose_model_input == "pairs" else self.num_input_frames
 
+        # frame_ids必须以0开头; 即第一个必须为当前输入的样本图像
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
 
+        # 是否需要使用位姿网络
         self.use_pose_net = not (self.opt.use_stereo and self.opt.frame_ids == [0])
 
+        # 如果使用stereo训练，帧数的id追加 "s"; "s"代表双目当前帧的另一侧的图片；
         if self.opt.use_stereo:
             self.opt.frame_ids.append("s")
 
+        """ 
+        ---------------------------------------------- 搭建网络结构 ------------------------------------------------------
+        self.models["encoder"]：     编码层，基于resnet搭建
+        self.models["depth"]：       depth网络把得到的四种尺度图像输入encoder，得到futures再输入depth_decoder。整个网络类似于U-NET结构。
+        self.models["pose_encoder"]：相机位姿网络的编码层
+        self.models["pose"]：        相机位姿网络的解码层
+        """
+        # 搭建encoder模块
         self.models["encoder"] = networks.ResnetEncoder(
             self.opt.num_layers, self.opt.weights_init == "pretrained")
         self.models["encoder"].to(self.device)
+        # parameters里存的就是weight，parameters()会返回一个生成器（迭代器）
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
+        # 搭建depth网络
         self.models["depth"] = networks.DepthDecoder(
             self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
 
+        # 搭建pose网络
         if self.use_pose_net:
+            
+            # 当pose网络采用独立的resnet时，重新搭建encoder
             if self.opt.pose_model_type == "separate_resnet":
                 self.models["pose_encoder"] = networks.ResnetEncoder(
                     self.opt.num_layers,
                     self.opt.weights_init == "pretrained",
                     num_input_images=self.num_pose_frames)
-
                 self.models["pose_encoder"].to(self.device)
                 self.parameters_to_train += list(self.models["pose_encoder"].parameters())
-
+                
+                # 搭建pose网络的decoder层
                 self.models["pose"] = networks.PoseDecoder(
                     self.models["pose_encoder"].num_ch_enc,
                     num_input_features=1,
                     num_frames_to_predict_for=2)
 
+            # 当采用共享的encoder时，直接使用depth网络搭建的encoder层
             elif self.opt.pose_model_type == "shared":
                 self.models["pose"] = networks.PoseDecoder(
                     self.models["encoder"].num_ch_enc, self.num_pose_frames)
 
+            # 当采用posecnn时，重新搭建pose网络
             elif self.opt.pose_model_type == "posecnn":
                 self.models["pose"] = networks.PoseCNN(
+                    # 输入帧数如果是”pair“ 则为 2; 否则为 len(self.opt.frame_ids) 通常为 3，仅在 stereo训练时为 1
                     self.num_input_frames if self.opt.pose_model_input == "all" else 2)
 
             self.models["pose"].to(self.device)
             self.parameters_to_train += list(self.models["pose"].parameters())
 
+        # 使用 Zhou 等人的预测掩码方案， 此时需要禁用 automasking
         if self.opt.predictive_mask:
             assert self.opt.disable_automasking, \
                 "When using predictive_mask, please disable automasking with --disable_automasking"
 
             # Our implementation of the predictive masking baseline has the the same architecture
             # as our depth decoder. We predict a separate mask for each source frame.
+            # 作者的预测掩蔽基线的实现与其深度解码器具有相同的架构，并为每个源帧预测一个单独的掩码。
             self.models["predictive_mask"] = networks.DepthDecoder(
                 self.models["encoder"].num_ch_enc, self.opt.scales,
                 num_output_channels=(len(self.opt.frame_ids) - 1))
             self.models["predictive_mask"].to(self.device)
             self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
+        # 采用 Adam 优化器对模型参数进行优化训练
+        # ----------------------------------------------------------------------------------------------------
+        # 语法： torch.optim.Adam(params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)[source]
+        #     params (iterable)：                 待优化参数的iterable或者是定义了参数组的dict
+        #     lr (float, 可选)：                   学习率（默认：1e-3）
+        #     betas (Tuple[float, float], 可选)：  用于计算梯度以及梯度平方的运行平均值的系数（默认：0.9，0.999）
+        #     eps (float, 可选)：                  为了增加数值计算的稳定性而加到分母里的项（默认：1e-8）
+        #     weight_decay (float, 可选)：         权重衰减（L2惩罚）（默认: 0）
+        # ----------------------------------------------------------------------------------------------------
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
+        
+        # 模型学习率调整策略
+        # ----------------------------------------------------------------------------------------------------
+        # 语法： torch.optim.lr_scheduler.StepLR(optimizer, step_size, gamma=0.1, last_epoch=-1)
+        #     optimizer （Optimizer）：要更改学习率的优化器；
+        #     step_size（int）：       每训练step_size个epoch，更新一次参数；
+        #     gamma（float）：         更新lr的乘法因子；
+        #     last_epoch （int）：     最后一个epoch的index，如果是训练了很多个epoch后中断了，继续训练，这个值就等于
+        #                            加载的模型的epoch。默认为-1表示从头开始训练，即从epoch=1开始。
+        # ----------------------------------------------------------------------------------------------------
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1)
 
+        # 加载预训练权重，包括模型和Adam优化器
         if self.opt.load_weights_folder is not None:
             self.load_model()
 
@@ -110,26 +156,53 @@ class Trainer:
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
         print("Training is using:\n  ", self.device)
 
+
+        """--------------------------------------------- 加载数据集 ---------------------------------------------------"""
+        # 主要用到了两种不同的数据集：KITTI raw data(原始数据) 和 KITTI odometry(里程计)
         # data
         datasets_dict = {"kitti": datasets.KITTIRAWDataset,
                          "kitti_odom": datasets.KITTIOdomDataset}
         self.dataset = datasets_dict[self.opt.dataset]
 
+        # os.path.dirname(__file__):  返回当前.py文件的上一级目录的绝对路径
         fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
 
+        # 读取训练集和验证集文件
         train_filenames = readlines(fpath.format("train"))
         val_filenames = readlines(fpath.format("val"))
         img_ext = '.png' if self.opt.png else '.jpg'
 
+        # 训练样本的数量
         num_train_samples = len(train_filenames)
+        # 训练数据集生成器产生的总步数。epoch × （每个epoch训练的）
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
-
+        
+        # 加载训练数据集
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+        
+        # ----------------------------------------------------------------------------------------------------
+        # 语法: DataLoader(dataset, batch_size=1, shuffle=False, sampler=None, batch_sampler=None, num_workers=0,
+        #            collate_fn=None, pin_memory=False, drop_last=False, timeout=0, worker_init_fn=None, *,
+        #            prefetch_factor=2, persistent_workers=False)
+        # 主要参数：
+        #        dataset：       必须首先使用数据集构造 DataLoader 类。
+        #        Shuffle ：      是否重新整理数据。
+        #        Sampler ：      指的是可选的 torch.utils.data.Sampler 类实例。采样器定义了检索样本的策略，顺序或随机或任何其他方式。
+        #                        使用采样器时应将 Shuffle 设置为 false。
+        #        Batch_Sampler ：批处理级别。
+        #        num_workers ：  加载数据所需的子进程数。
+        #        collate_fn ：   将样本整理成批次。Torch 中可以进行自定义整理。
+        #        pin_memory：    锁页内存。pin_memory=True，意味着生成的Tensor数据最开始是属于内存中的锁页内存（显存），这样将内存的Tensor转义到GPU的显存就会更快一些
+        #                        不锁页内存在主机内存不足时，数据会存放在虚拟内存（硬盘）中。锁页内存存放的内容在任何情况下都不会与主机的虚拟内存进行交换
+        #        drop_last ：    告诉如何处理数据集长度除于batch_size余下的数据。True就抛弃，否则保留
+        # ----------------------------------------------------------------------------------------------------
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+        
+        # 加载验证数据集
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
@@ -140,13 +213,16 @@ class Trainer:
 
         self.writers = {}
         for mode in ["train", "val"]:
-            self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
+            self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))   # 定义logs文件位置
 
+        # 使用ssim 损失衡量 重构图像和原始图像之间的差异
         if not self.opt.no_ssim:
             self.ssim = SSIM()
             self.ssim.to(self.device)
 
+        # 保存不同尺度下，将深度图像投影为点云的网络层
         self.backproject_depth = {}
+         # 保存不同尺度下，将3D点云投影到相机中的网络层
         self.project_3d = {}
         for scale in self.opt.scales:
             h = self.opt.height // (2 ** scale)
@@ -169,6 +245,7 @@ class Trainer:
 
     def set_train(self):
         """Convert all models to training mode
+           将所有模型转换为训练模式
         """
         for m in self.models.values():
             m.train()
@@ -181,6 +258,7 @@ class Trainer:
 
     def train(self):
         """Run the entire training pipeline
+           运行整个训练pipeline
         """
         self.epoch = 0
         self.step = 0
@@ -188,20 +266,22 @@ class Trainer:
         for self.epoch in range(self.opt.num_epochs):
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
-                self.save_model()
+                self.save_model()   # 保存模型
 
     def run_epoch(self):
         """Run a single epoch of training and validation
+           运行每个Epoch的训练和验证
         """
-        self.model_lr_scheduler.step()
+        self.model_lr_scheduler.step()  # 更新学习率
 
         print("Training")
-        self.set_train()
+        self.set_train()                # 将所有模型转换为训练模式
 
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
 
+            # 通过网络传递一个小批量并生成图像和损失
             outputs, losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
@@ -227,6 +307,9 @@ class Trainer:
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
+           通过网络传递一个小批量并生成图像和损失
+           网络的input最终是大小为(双目+单目：42)的字典，是通过CPU进行运算的。
+           这里的42 = 4(输入的4张图) × 4(4个尺度) × 2(数据增强) + 4(K矩阵4个尺度) × 2(加上逆矩阵) + 2
         """
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
@@ -234,6 +317,7 @@ class Trainer:
         if self.opt.pose_model_type == "shared":
             # If we are using a shared encoder for both depth and pose (as advocated
             # in monodepthv1), then all images are fed separately through the depth encoder.
+            # 如果我们对深度和姿态都使用共享encoder（如 monodepthv1 中所提倡的），那么所有图像都通过深度编码器单独前向传播。
             all_color_aug = torch.cat([inputs[("color_aug", i, 0)] for i in self.opt.frame_ids])
             all_features = self.models["encoder"](all_color_aug)
             all_features = [torch.split(f, self.opt.batch_size) for f in all_features]
@@ -245,6 +329,7 @@ class Trainer:
             outputs = self.models["depth"](features[0])
         else:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
+            # 否则，只通过深度编码器输入 frame_id 为 0 的图像
             features = self.models["encoder"](inputs["color_aug", 0, 0])
             outputs = self.models["depth"](features)
 
@@ -252,17 +337,26 @@ class Trainer:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
 
         if self.use_pose_net:
+            # a.update(b)：
+            # 用 update 更新字典 a，会有两种情况：
+            # （1）有相同的键时：    会使用最新的字典 b 中 该 key 对应的 value 值。
+            # （2）有新的键时：      会直接把字典 b 中的 key、value 加入到 a 中。
             outputs.update(self.predict_poses(inputs, features))
 
+        # 为小批量生成扭曲（重新投影）的彩色图像
         self.generate_images_pred(inputs, outputs)
+        
+        # 计算损失
         losses = self.compute_losses(inputs, outputs)
 
         return outputs, losses
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
+           预测单目序列的输入帧之间的位姿。
         """
         outputs = {}
+        # 在此设置中，我们通过姿态网络的单独前向传递计算每个源帧的姿态。
         if self.num_pose_frames == 2:
             # In this setting, we compute the pose to each source frame via a
             # separate forward pass through the pose network.
@@ -603,24 +697,27 @@ class Trainer:
         torch.save(self.model_optimizer.state_dict(), save_path)
 
     def load_model(self):
-        """Load model(s) from disk
+        """Load model(s) from disk 从磁盘加载模型
         """
+        # os.path.expanduser(): 它可以将参数中开头部分的 ~ 或 ~user 替换为当前用户的home目录并返回, 即展开
         self.opt.load_weights_folder = os.path.expanduser(self.opt.load_weights_folder)
 
+        # 权重路径 必须是 文件夹
         assert os.path.isdir(self.opt.load_weights_folder), \
             "Cannot find folder {}".format(self.opt.load_weights_folder)
         print("loading model from folder {}".format(self.opt.load_weights_folder))
 
-        for n in self.opt.models_to_load:
+        # 加载每个网络的预训练权重
+        for n in self.opt.models_to_load:               # ["encoder", "depth", "pose_encoder", "pose"]
             print("Loading {} weights...".format(n))
             path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
             model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
+            pretrained_dict = torch.load(path)          # 从文件中加载一个用torch.save()保存的对象
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-            model_dict.update(pretrained_dict)
-            self.models[n].load_state_dict(model_dict)
+            model_dict.update(pretrained_dict)          # 把预训练有的网络层的参数更新进来
+            self.models[n].load_state_dict(model_dict)  # 加载到网络
 
-        # loading adam state
+        # loading adam state 加载Adam权重
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
         if os.path.isfile(optimizer_load_path):
             print("Loading Adam weights")

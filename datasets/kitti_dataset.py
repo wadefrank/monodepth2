@@ -57,16 +57,19 @@ class KITTIDataset(MonoDataset):
 
 class KITTIRAWDataset(KITTIDataset):
     """KITTI dataset which loads the original velodyne depth maps for ground truth
+       KITTI 数据集：加载原始 velodyne 深度图作为真值
     """
     def __init__(self, *args, **kwargs):
         super(KITTIRAWDataset, self).__init__(*args, **kwargs)
 
+    """ 获取彩色图片的路径 """
     def get_image_path(self, folder, frame_index, side):
         f_str = "{:010d}{}".format(frame_index, self.img_ext)
         image_path = os.path.join(
             self.data_path, folder, "image_0{}/data".format(self.side_map[side]), f_str)
         return image_path
 
+    """ 获取深度真值 """
     def get_depth(self, folder, frame_index, side, do_flip):
         calib_path = os.path.join(self.data_path, folder.split("/")[0])
 
@@ -75,11 +78,14 @@ class KITTIRAWDataset(KITTIDataset):
             folder,
             "velodyne_points/data/{:010d}.bin".format(int(frame_index)))
 
+        # 从 velodyne 数据生成深度图
         depth_gt = generate_depth_map(calib_path, velo_filename, self.side_map[side])
+        # 对真实深度进行尺度缩放，会顺便把图片的像素归一化缩放到(0,1)区间内；order=0：最近邻插值，preserve_range=True：保持原来的取值范围。
         depth_gt = skimage.transform.resize(
             depth_gt, self.full_res_shape[::-1], order=0, preserve_range=True, mode='constant')
 
         if do_flip:
+            # 矩阵左右翻转
             depth_gt = np.fliplr(depth_gt)
 
         return depth_gt
