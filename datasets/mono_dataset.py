@@ -96,13 +96,19 @@ class MonoDataset(data.Dataset):
         我们预先创建了 color_aug 对象，并将相同的增强应用于该项目中的所有图像。
         这确保了输入到姿态网络的所有图像都接收到相同的增强。
         """
+        # 增加不同尺度图像的color到inputs中
+        # ('color', 0, 0) size = 640 x 192
+        # ('color', 0, 1) size = 320 x  96
+        # ('color', 0, 2) size = 160 x  48
+        # ('color', 0, 3) size =  80 x  24
         for k in list(inputs):
             frame = inputs[k]
-            if "color" in k:
+            if "color" in k:    
                 n, im, i = k
                 for i in range(self.num_scales):
                     inputs[(n, im, i)] = self.resize[i](inputs[(n, im, i - 1)])
 
+        # 图像color增强
         for k in list(inputs):
             f = inputs[k]
             if "color" in k:
@@ -173,7 +179,7 @@ class MonoDataset(data.Dataset):
                 other_side = {"r": "l", "l": "r"}[side]
                 inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
             else:
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)   # (1242, 375)，kitti原始图像大小
 
         # adjusting intrinsics to match each scale in the pyramid
         # 调整内置参数以匹配金字塔（多尺度）中的每个比例

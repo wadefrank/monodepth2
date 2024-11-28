@@ -27,10 +27,13 @@ def disp_to_depth(disp, min_depth, max_depth):
 
 def transformation_from_parameters(axisangle, translation, invert=False):
     """Convert the network's (axisangle, translation) output into a 4x4 matrix
+       将网络的 (axisangle, translation) 输出转换为 4x4 矩阵 
     """
+    # R 为将轴角旋转转换得到的 4x4 变换矩阵
     R = rot_from_axisangle(axisangle)
     t = translation.clone()
 
+    # 是否需要反转矩阵
     if invert:
         R = R.transpose(1, 2)
         t *= -1
@@ -172,6 +175,7 @@ class BackprojectDepth(nn.Module):
                                        requires_grad=False)
 
     def forward(self, depth, inv_K):
+        # [X, Y, Z]^T = K^-1 * [u, v, 1]^T * depth
         cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords)
         cam_points = depth.view(self.batch_size, 1, -1) * cam_points
         cam_points = torch.cat([cam_points, self.ones], 1)
@@ -192,13 +196,19 @@ class Project3D(nn.Module):
         self.eps = eps
 
     def forward(self, points, K, T):
+        
         P = torch.matmul(K, T)[:, :3, :]
 
         cam_points = torch.matmul(P, points)
 
         pix_coords = cam_points[:, :2, :] / (cam_points[:, 2, :].unsqueeze(1) + self.eps)
         pix_coords = pix_coords.view(self.batch_size, 2, self.height, self.width)
+        
+        # 调整张量的维度顺序，将 pix_coords 变为 [batch_size, height, width, 2]
+        # 这样，像素坐标的 u 和 v 分量分别对应于最后的维度 2
         pix_coords = pix_coords.permute(0, 2, 3, 1)
+        
+        # 将像素坐标从 [0, width-1] 和 [0, height-1] 范围转换到 [-1, 1] 范围。
         pix_coords[..., 0] /= self.width - 1
         pix_coords[..., 1] /= self.height - 1
         pix_coords = (pix_coords - 0.5) * 2

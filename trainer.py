@@ -281,7 +281,7 @@ class Trainer:
 
             before_op_time = time.time()
 
-            # 通过网络传递一个小批量并生成图像和损失
+            # 通过网络传递一个小批量，并生成图像和损失
             outputs, losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
@@ -308,8 +308,8 @@ class Trainer:
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
            通过网络传递一个小批量并生成图像和损失
-           网络的input最终是大小为(双目+单目：42)的字典，是通过CPU进行运算的。
-           这里的42 = 4(输入的4张图) × 4(4个尺度) × 2(数据增强) + 4(K矩阵4个尺度) × 2(加上逆矩阵) + 2
+           网络的input最终是大小为(单目：33)的字典
+           这里的33 = 3(输入的3张图) × 4(4个尺度) × 2(数据增强) + 4(K矩阵4个尺度) × 2(加上逆矩阵) + 1(depth_gt)
         """
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
@@ -330,8 +330,8 @@ class Trainer:
         else:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
             # 否则，只通过深度编码器输入 frame_id 为 0 的图像
-            features = self.models["encoder"](inputs["color_aug", 0, 0])
-            outputs = self.models["depth"](features)
+            features = self.models["encoder"](inputs["color_aug", 0, 0])    # ResnetEncoder(resnet18)
+            outputs = self.models["depth"](features)                        # DepthDecoder
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
@@ -356,12 +356,13 @@ class Trainer:
            预测单目序列的输入帧之间的位姿。
         """
         outputs = {}
-        # 在此设置中，我们通过姿态网络的单独前向传递计算每个源帧的姿态。
         if self.num_pose_frames == 2:
             # In this setting, we compute the pose to each source frame via a
             # separate forward pass through the pose network.
-
+            # 在此设置中，我们通过姿态网络的单独前向传递计算每个源帧的姿态。
             # select what features the pose network takes as input
+            # 选择姿态网络作为输入的特征
+            # self.opt.pose_model_type == "posecnn"
             if self.opt.pose_model_type == "shared":
                 pose_feats = {f_i: features[f_i] for f_i in self.opt.frame_ids}
             else:
@@ -370,6 +371,7 @@ class Trainer:
             for f_i in self.opt.frame_ids[1:]:
                 if f_i != "s":
                     # To maintain ordering we always pass frames in temporal order
+                    # 为了保持顺序，总是按时间顺序传递帧
                     if f_i < 0:
                         pose_inputs = [pose_feats[f_i], pose_feats[0]]
                     else:
@@ -434,21 +436,32 @@ class Trainer:
 
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
+           为小批量生成扭曲（重新投影）的彩色图像。
         Generated images are saved into the `outputs` dictionary.
+        生成的图像被保存到 `outputs` 字典中。
         """
+        # outputs["disp"]直接输出的就是视差图，并且仍然多尺度[0,1,2,3]分布。
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
             if self.opt.v1_multiscale:
                 source_scale = scale
             else:
+                # ------------------------------------------------------------------------------------------------------
+                # 语法：torch.nn.functional.interpolate(input, size=None, scale_factor=None, mode='nearest',
+                #                                       align_corners=None, recompute_scale_factor=None)
+                # 详解参考： https://blog.csdn.net/qq_50001789/article/details/120297401
+                # ------------------------------------------------------------------------------------------------------
                 disp = F.interpolate(
                     disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
                 source_scale = 0
 
+            # 将disp值映射到[0.01,10]，并求倒数就能得到深度值
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
 
+            # 将深度值存放到outputs["depth"...]中
             outputs[("depth", 0, scale)] = depth
 
+            # 在stereo 训练时， frame_id恒为"s"。
             for i, frame_id in enumerate(self.opt.frame_ids[1:]):
 
                 if frame_id == "s":
@@ -468,17 +481,24 @@ class Trainer:
                     T = transformation_from_parameters(
                         axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
 
+                # get 3D points in the source frame
+                # 将深度图投影成3维点云
                 cam_points = self.backproject_depth[source_scale](
                     depth, inputs[("inv_K", source_scale)])
+                # 将3维点云投影成二维图像
                 pix_coords = self.project_3d[source_scale](
                     cam_points, inputs[("K", source_scale)], T)
-
+                # 将二维图像赋值给outputs[("sample"..)]
                 outputs[("sample", frame_id, scale)] = pix_coords
 
+                # outputs上某点(x,y)的三个通道像素值来自于inputs上的(x',y'); 而x'和y'则由outputs(x,y)的最低维[0]和[1].
+                # grid_sample(input, grid, mode = "bilinear", padding_mode = "zeros", align_corners = None)：
+                #           提供一个input以及一个网格，然后根据grid中每个位置提供的坐标信息(input中pixel的坐标)，
+                #           将input中对应位置的像素值填充到grid指定的位置，得到最终的输出。
                 outputs[("color", frame_id, scale)] = F.grid_sample(
                     inputs[("color", frame_id, source_scale)],
                     outputs[("sample", frame_id, scale)],
-                    padding_mode="border")
+                    padding_mode="border")  # padding_mode="border": 对于越界的位置在⽹格中采⽤边界的pixel value进⾏填充。
 
                 if not self.opt.disable_automasking:
                     outputs[("color_identity", frame_id, scale)] = \
@@ -486,10 +506,14 @@ class Trainer:
 
     def compute_reprojection_loss(self, pred, target):
         """Computes reprojection loss between a batch of predicted and target images
+           计算一批预测图像和目标图像之间的重投影损失
+           pred    :   预测图像
+           target  :   目标图像
         """
-        abs_diff = torch.abs(target - pred)
-        l1_loss = abs_diff.mean(1, True)
+        abs_diff = torch.abs(target - pred)     # 预测图像和目标图像之间的绝对误差，即 l1 距离
+        l1_loss = abs_diff.mean(1, True)        # 在dim=1维度取均值，并保持维度不变
 
+        # 如果不采用ssim计算重投影损失，则采用l1损失计算；默认为False，即采用ssim损失
         if self.opt.no_ssim:
             reprojection_loss = l1_loss
         else:
@@ -594,8 +618,12 @@ class Trainer:
 
         This isn't particularly accurate as it averages over the entire batch,
         so is only used to give an indication of validation performance
+        计算深度损失，以便在训练期间进行监督
+        这并不是特别准确，因为它是整个批次的平均值，因此仅用于指示验证性能
         """
         depth_pred = outputs[("depth", 0, 0)]
+        # torch.clamp(input, min, max, out=None) → Tensor
+        # 作用：将输入input张量每个元素的夹紧到区间 [min,max][min,max]，并返回结果到一个新张量。
         depth_pred = torch.clamp(F.interpolate(
             depth_pred, [375, 1242], mode="bilinear", align_corners=False), 1e-3, 80)
         depth_pred = depth_pred.detach()
@@ -610,12 +638,22 @@ class Trainer:
 
         depth_gt = depth_gt[mask]
         depth_pred = depth_pred[mask]
+        
+        # --------------------------------------------------------------------------------------------------------------
+        # 语法：torch.median(input, dim=-1, values=None, indices=None) -> (Tensor, LongTensor):
+        # 作用：返回输入张量给定维度每行的中位数，同时返回一个包含中位数的索引。dim默认为输入张量的最后一维
+        #     input(Tensor) ：输入张量
+        #     dim(int)      ：缩减的维度
+        #     values(Tensor, optional)  ： 结果张量
+        #     indices(Tensor, optional) ： 返回的索引结果张量
         depth_pred *= torch.median(depth_gt) / torch.median(depth_pred)
 
         depth_pred = torch.clamp(depth_pred, min=1e-3, max=80)
 
+        # 计算真实深度标签和预测的深度图之间的误差，返回一个元组 包括：abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
         depth_errors = compute_depth_errors(depth_gt, depth_pred)
 
+        # 统一保存到losses中
         for i, metric in enumerate(self.depth_metric_names):
             losses[metric] = np.array(depth_errors[i].cpu())
 
