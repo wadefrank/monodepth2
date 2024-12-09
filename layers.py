@@ -239,6 +239,8 @@ def get_smooth_loss(disp, img):
 
 class SSIM(nn.Module):
     """Layer to compute the SSIM loss between a pair of images
+    计算一对图像之间的 Structural Similarity (SSIM) 损失， 用于度量重建后的图片和原图的结构相似性
+    详解参考： https://blog.csdn.net/Kevin_cc98/article/details/79028507
     """
     def __init__(self):
         super(SSIM, self).__init__()

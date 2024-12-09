@@ -368,6 +368,7 @@ class Trainer:
             else:
                 pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}
 
+            # frame_ids = [0, -1, 1]
             for f_i in self.opt.frame_ids[1:]:
                 if f_i != "s":
                     # To maintain ordering we always pass frames in temporal order
@@ -382,16 +383,19 @@ class Trainer:
                     elif self.opt.pose_model_type == "posecnn":
                         pose_inputs = torch.cat(pose_inputs, 1)
 
+                    # 通过pose解码器得到输出的 轴角 和 平移
                     axisangle, translation = self.models["pose"](pose_inputs)
                     outputs[("axisangle", 0, f_i)] = axisangle
                     outputs[("translation", 0, f_i)] = translation
 
                     # Invert the matrix if the frame id is negative
+                    # 如果帧 id 为负，则反转矩阵
                     outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
                         axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
 
         else:
             # Here we input all frames to the pose net (and predict all poses) together
+            # 将所有帧一起输入到姿态网络（并预测所有姿态）
             if self.opt.pose_model_type in ["separate_resnet", "posecnn"]:
                 pose_inputs = torch.cat(
                     [inputs[("color_aug", i, 0)] for i in self.opt.frame_ids if i != "s"], 1)
@@ -524,27 +528,34 @@ class Trainer:
 
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch
+        计算小批量的重投影和平滑损失
         """
         losses = {}
         total_loss = 0
 
+        # 按不同尺度来分别计算loss
         for scale in self.opt.scales:
             loss = 0
             reprojection_losses = []
 
+            # 如果使用v1的多尺度，则color 与 target相同; 默认为False
             if self.opt.v1_multiscale:
                 source_scale = scale
             else:
                 source_scale = 0
 
-            disp = outputs[("disp", scale)]
-            color = inputs[("color", 0, scale)]
-            target = inputs[("color", 0, source_scale)]
+            disp = outputs[("disp", scale)]                 # 按尺度获得视差图
+            color = inputs[("color", 0, scale)]             # 按尺度获得原始输入图
+            target = inputs[("color", 0, source_scale)]     # 0 尺度的原始输入图
 
+            # frame_ids = [0, -1, 1]
             for frame_id in self.opt.frame_ids[1:]:
+                # 按尺度获得对应图像的预测图，即深度图转换到点云再转到二维图像最后采样得到的彩图
                 pred = outputs[("color", frame_id, scale)]
+                # 根据pred多尺度图和0尺度
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
-
+            
+            # 将 -1，1帧 或者 “s” 的重投影损失 在 dim=1 维度上进行拼接
             reprojection_losses = torch.cat(reprojection_losses, 1)
 
             if not self.opt.disable_automasking:
