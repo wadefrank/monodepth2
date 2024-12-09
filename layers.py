@@ -15,8 +15,10 @@ import torch.nn.functional as F
 
 def disp_to_depth(disp, min_depth, max_depth):
     """Convert network's sigmoid output into depth prediction
+       将网络的 sigmoid 输出转换为深度预测
     The formula for this conversion is given in the 'additional considerations'
-    section of the paper.
+    section of the paper. 
+    此转换的公式在论文的“其他注意事项”部分中给出。
     """
     min_disp = 1 / max_depth
     max_disp = 1 / min_depth
@@ -217,13 +219,33 @@ class Project3D(nn.Module):
 
 def upsample(x):
     """Upsample input tensor by a factor of 2
+       将输入tensor上采样 2 倍
     """
+
+    # --------------------------------------------------------------------------------------------------
+    # 语法：torch.nn.functional.interpolate(input, size=None, scale_factor=None, mode='nearest',
+    #                                      align_corners=None, recompute_scale_factor=None)
+    # input(Tensor) ：             需要进行采样处理的数组。
+    # size(int或序列)：             输出空间的大小
+    # scale_factor(float或序列)：   空间大小的乘数
+    # mode(str)：                  用于采样的算法。'nearest'| 'linear'| 'bilinear'| 'bicubic'| 'trilinear'
+    #       | 'area'。默认：'nearest'
+    # align_corners(bool)：        在几何上，我们将输入和输出的像素视为正方形而不是点。如果设置为True，则输入和输出张量
+    #       按其角像素的中心点对齐，保留角像素处的值。 如果设置为False，则输入和输出张量通过其角像素的角点对齐，并且插值使
+    #       用边缘值填充用于边界外值，使此操作在保持不变时独立于输入大小scale_factor。
+    # recompute_scale_facto(bool)：重新计算用于插值计算的 scale_factor。当scale_factor作为参数传递时，
+    #       它用于计算output_size。如果recompute_scale_factor的False或没有指定，传入的scale_factor将在插值计算中
+    #       使用。否则，将根据用于插值计算的输出和输入大小计算新的scale_factor（即，如果计算的output_size显式传入， 则
+    #       计算将相同 ）。注意当scale_factor 是浮点数，由于舍入和精度问题，重新计算的 scale_factor 可能与传入的不同。
+    # --------------------------------------------------------------------------------------------------
     return F.interpolate(x, scale_factor=2, mode="nearest")
 
 
 def get_smooth_loss(disp, img):
     """Computes the smoothness loss for a disparity image
+       计算视差图像的平滑度损失
     The color image is used for edge-aware smoothness
+    彩色图像用于边缘感知平滑度
     """
     grad_disp_x = torch.abs(disp[:, :, :, :-1] - disp[:, :, :, 1:])
     grad_disp_y = torch.abs(disp[:, :, :-1, :] - disp[:, :, 1:, :])
@@ -244,6 +266,8 @@ class SSIM(nn.Module):
     """
     def __init__(self):
         super(SSIM, self).__init__()
+        # 语法：  torch.nn.AvgPool2d(kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True)
+        # 采用 kernel_size = 3， stride = 1 的窗口做平均池化
         self.mu_x_pool   = nn.AvgPool2d(3, 1)
         self.mu_y_pool   = nn.AvgPool2d(3, 1)
         self.sig_x_pool  = nn.AvgPool2d(3, 1)
@@ -259,21 +283,23 @@ class SSIM(nn.Module):
         x = self.refl(x)
         y = self.refl(y)
 
-        mu_x = self.mu_x_pool(x)
-        mu_y = self.mu_y_pool(y)
+        mu_x = self.mu_x_pool(x)                            # x的局部均值
+        mu_y = self.mu_y_pool(y)                            # y的局部均值
 
-        sigma_x  = self.sig_x_pool(x ** 2) - mu_x ** 2
-        sigma_y  = self.sig_y_pool(y ** 2) - mu_y ** 2
-        sigma_xy = self.sig_xy_pool(x * y) - mu_x * mu_y
+        sigma_x  = self.sig_x_pool(x ** 2) - mu_x ** 2      # x的局部方差 D(X)=E(X^2)-E(X)^2
+        sigma_y  = self.sig_y_pool(y ** 2) - mu_y ** 2      # y的局部方差
+        sigma_xy = self.sig_xy_pool(x * y) - mu_x * mu_y    # 计算协方差  D(XY)=E(X*Y)-E(X)*E(Y)
 
         SSIM_n = (2 * mu_x * mu_y + self.C1) * (2 * sigma_xy + self.C2)
         SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
 
+        # clamp(input, min, max, out=None) ： 功能将输入input张量每个元素的值压缩到区间 [min,max]，并返回结果到一个新张量。
         return torch.clamp((1 - SSIM_n / SSIM_d) / 2, 0, 1)
 
 
 def compute_depth_errors(gt, pred):
     """Computation of error metrics between predicted and ground truth depths
+       计算预测和真实标签深度之间的误差度量
     """
     thresh = torch.max((gt / pred), (pred / gt))
     a1 = (thresh < 1.25     ).float().mean()

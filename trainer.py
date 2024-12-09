@@ -284,23 +284,33 @@ class Trainer:
             # 通过网络传递一个小批量，并生成图像和损失
             outputs, losses = self.process_batch(inputs)
 
+            # 将优化器的梯度置0
             self.model_optimizer.zero_grad()
+            # 损失反向传播
             losses["loss"].backward()
+            # 更新参数
             self.model_optimizer.step()
 
+            # 当前batch所经历的时间
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000
-            late_phase = self.step % 2000 == 0
+            # 在 2000 步后减少日志记录以节省时间和磁盘空间
+            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000  # 前2000步
+            late_phase = self.step % 2000 == 0                                          # 2000的倍数
 
             if early_phase or late_phase:
+                # 在控制台打印相关日志
                 self.log_time(batch_idx, duration, losses["loss"].cpu().data)
 
+                # 如果输入数据中存在深度真值，则计算深度损失
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
 
+                # 将本次训练的结果保存到tensorboard内
                 self.log("train", inputs, outputs, losses)
+                
+                # 开始本次验证
                 self.val()
 
             self.step += 1
@@ -465,15 +475,15 @@ class Trainer:
             # 将深度值存放到outputs["depth"...]中
             outputs[("depth", 0, scale)] = depth
 
-            # 在stereo 训练时， frame_id恒为"s"。
+            # 在单目训练时，frame_ids为[0, -1, 1]
             for i, frame_id in enumerate(self.opt.frame_ids[1:]):
-
                 if frame_id == "s":
                     T = inputs["stereo_T"]
                 else:
                     T = outputs[("cam_T_cam", 0, frame_id)]
 
                 # from the authors of https://arxiv.org/abs/1712.00175
+                # 如果使用posecnn网络输出位姿
                 if self.opt.pose_model_type == "posecnn":
 
                     axisangle = outputs[("axisangle", 0, frame_id)]
@@ -486,12 +496,14 @@ class Trainer:
                         axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
 
                 # get 3D points in the source frame
-                # 将深度图投影成3维点云
+                # 将深度图投影成3维点云（使用BackprojectDepth.forward(self, depth, inv_K)）
                 cam_points = self.backproject_depth[source_scale](
                     depth, inputs[("inv_K", source_scale)])
-                # 将3维点云投影成二维图像
+                
+                # 将3维点云投影成二维图像（使用Project3D.forward(self, points, K, T)）
                 pix_coords = self.project_3d[source_scale](
                     cam_points, inputs[("K", source_scale)], T)
+                
                 # 将二维图像赋值给outputs[("sample"..)]
                 outputs[("sample", frame_id, scale)] = pix_coords
 
@@ -548,16 +560,17 @@ class Trainer:
             color = inputs[("color", 0, scale)]             # 按尺度获得原始输入图
             target = inputs[("color", 0, source_scale)]     # 0 尺度的原始输入图
 
-            # frame_ids = [0, -1, 1]
+            # 在单目训练时，frame_ids = [0, -1, 1]
             for frame_id in self.opt.frame_ids[1:]:
                 # 按尺度获得对应图像的预测图，即深度图转换到点云再转到二维图像最后采样得到的彩图
                 pred = outputs[("color", frame_id, scale)]
                 # 根据pred多尺度图和0尺度
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
             
-            # 将 -1，1帧 或者 “s” 的重投影损失 在 dim=1 维度上进行拼接
+            # 单目：将 -1 和 1 帧的重投影损失 在 dim=1 维度上进行拼接
             reprojection_losses = torch.cat(reprojection_losses, 1)
 
+            # 直接对 inputs["color", 0, 0] 和 ["color", -1/1, 0] 计算 identity loss （恒等重投影损失）
             if not self.opt.disable_automasking:
                 identity_reprojection_losses = []
                 for frame_id in self.opt.frame_ids[1:]:
@@ -567,16 +580,19 @@ class Trainer:
 
                 identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
 
-                if self.opt.avg_reprojection:
+                if self.opt.avg_reprojection:   # 平均重投影损失
                     identity_reprojection_loss = identity_reprojection_losses.mean(1, keepdim=True)
                 else:
                     # save both images, and do min all at once below
+                    # 保存两个图像，并在下面一次执行 min
                     identity_reprojection_loss = identity_reprojection_losses
 
+            # 使用（zhou等的）预测掩码
             elif self.opt.predictive_mask:
                 # use the predicted mask
                 mask = outputs["predictive_mask"]["disp", scale]
                 if not self.opt.v1_multiscale:
+                    # 对mask进行 双线性内插法将 mask 采样到 [self.opt.height, self.opt.width] <--> [192, 640]
                     mask = F.interpolate(
                         mask, [self.opt.height, self.opt.width],
                         mode="bilinear", align_corners=False)
@@ -584,6 +600,7 @@ class Trainer:
                 reprojection_losses *= mask
 
                 # add a loss pushing mask to 1 (using nn.BCELoss for stability)
+                # mask <---> 1 之间的损失（使用 nn.BCELoss 来保持稳定性）
                 weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda())
                 loss += weighting_loss.mean()
 
@@ -594,6 +611,7 @@ class Trainer:
 
             if not self.opt.disable_automasking:
                 # add random numbers to break ties
+                # 添加随机数来打破联系
                 identity_reprojection_loss += torch.randn(
                     identity_reprojection_loss.shape, device=self.device) * 0.00001
 
@@ -604,6 +622,14 @@ class Trainer:
             if combined.shape[1] == 1:
                 to_optimise = combined
             else:
+                # ------------------------------------------------------------------------------------------------------
+                # 语法：torch.min(input, dim, keepdim=False, out=None) -> (Tensor, LongTensor)
+                # 输入：
+                #     input ：表示输入的张量
+                #     dim   ：表示的是索引的维度，0和1分别表示列和行
+                # 输出：
+                #     返回两个tensor，第一个tensor表示对应维度的最小值；第二个tensor表示最小值的索引
+                # ------------------------------------------------------------------------------------------------------
                 to_optimise, idxs = torch.min(combined, dim=1)
 
             if not self.opt.disable_automasking:
@@ -612,10 +638,11 @@ class Trainer:
 
             loss += to_optimise.mean()
 
-            mean_disp = disp.mean(2, True).mean(3, True)
-            norm_disp = disp / (mean_disp + 1e-7)
-            smooth_loss = get_smooth_loss(norm_disp, color)
+            mean_disp = disp.mean(2, True).mean(3, True)        # 获取disp空间上的均值
+            norm_disp = disp / (mean_disp + 1e-7)               # 归一化 disp
+            smooth_loss = get_smooth_loss(norm_disp, color)     # 计算视差图像的平滑度损失
 
+            # self.opt.disparity_smoothness： 视差平滑损失权重
             loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
             total_loss += loss
             losses["loss/{}".format(scale)] = loss
@@ -716,13 +743,17 @@ class Trainer:
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
+           将option的所有参数保存，便于后续复现
         """
         models_dir = os.path.join(self.log_path, "models")
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
+        
+        # 拷贝 opt字典
         to_save = self.opt.__dict__.copy()
 
         with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
+            # json.dumps()将一个Python数据结构转换为JSON; indent: 参数根据数据格式缩进显示，读起来更加清晰。
             json.dump(to_save, f, indent=2)
 
     def save_model(self):
